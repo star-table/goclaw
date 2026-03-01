@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/smallnest/goclaw/agent"
@@ -27,18 +28,19 @@ var agentCmd = &cobra.Command{
 
 // Flags for agent command
 var (
-	agentMessage      string
-	agentTo           string
-	agentID           string
-	agentSessionID    string
-	agentThinking     string
-	agentVerbose      bool
-	agentChannel      string
-	agentLocal        bool
-	agentDeliver      bool
-	agentJSON         bool
-	agentTimeout      int
+	agentMessage       string
+	agentTo            string
+	agentID            string
+	agentSessionID     string
+	agentThinking      string
+	agentVerbose       bool
+	agentChannel       string
+	agentLocal         bool
+	agentDeliver       bool
+	agentJSON          bool
+	agentTimeout       int
 	agentMaxIterations int
+	agentStream        bool
 )
 
 func init() {
@@ -54,6 +56,7 @@ func init() {
 	agentCmd.Flags().BoolVar(&agentJSON, "json", false, "Output result as JSON")
 	agentCmd.Flags().IntVar(&agentTimeout, "timeout", 600, "Override agent command timeout (seconds)")
 	agentCmd.Flags().IntVar(&agentMaxIterations, "max-iterations", 15, "Maximum agent loop iterations")
+	agentCmd.Flags().BoolVar(&agentStream, "stream", false, "Enable streaming output")
 
 	_ = agentCmd.MarkFlagRequired("message")
 }
@@ -269,6 +272,13 @@ func runAgent(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	// Subscribe to agent events for streaming output
+	var eventChan <-chan *agent.Event
+	if agentStream {
+		eventChan = agentInstance.Subscribe()
+		defer agentInstance.Unsubscribe(eventChan)
+	}
+
 	// Start the agent to process the message
 	go func() {
 		if err := agentInstance.Start(ctx); err != nil && err != context.Canceled && err != context.DeadlineExceeded {
@@ -276,23 +286,29 @@ func runAgent(cmd *cobra.Command, args []string) {
 		}
 	}()
 
-	// Consume outbound message
-	outbound, err := messageBus.ConsumeOutbound(ctx)
-	if err != nil {
-		if agentJSON {
-			errorResult := map[string]interface{}{
-				"error":   err.Error(),
-				"success": false,
-			}
-			data, _ := json.MarshalIndent(errorResult, "", "  ")
-			fmt.Println(string(data))
-		} else {
-			fmt.Fprintf(os.Stderr, "Error consuming response: %v\n", err)
-		}
-		os.Exit(1)
-	}
+	var response string
 
-	response := outbound.Content
+	// Handle streaming output
+	if agentStream {
+		response = handleStreamingOutput(ctx, eventChan, messageBus, agentThinking)
+	} else {
+		// Non-streaming: consume outbound message
+		outbound, err := messageBus.ConsumeOutbound(ctx)
+		if err != nil {
+			if agentJSON {
+				errorResult := map[string]interface{}{
+					"error":   err.Error(),
+					"success": false,
+				}
+				data, _ := json.MarshalIndent(errorResult, "", "  ")
+				fmt.Println(string(data))
+			} else {
+				fmt.Fprintf(os.Stderr, "Error consuming response: %v\n", err)
+			}
+			os.Exit(1)
+		}
+		response = outbound.Content
+	}
 
 	// Stop the agent
 	if err := agentInstance.Stop(); err != nil && agentVerbose {
@@ -301,30 +317,106 @@ func runAgent(cmd *cobra.Command, args []string) {
 
 	// Note: Messages are already saved to session by Agent.handleInboundMessage
 
-	// Output response
-	if agentJSON {
-		result := map[string]interface{}{
-			"response": response,
-			"success":  true,
-			"session":  sessionKey,
+	// Output response (for streaming, output is already done)
+	if !agentStream {
+		if agentJSON {
+			result := map[string]interface{}{
+				"response": response,
+				"success":  true,
+				"session":  sessionKey,
+			}
+			data, err := json.MarshalIndent(result, "", "  ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error marshaling JSON: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println(string(data))
+		} else {
+			if agentThinking != "off" {
+				fmt.Println("\n💡 Response:")
+			}
+			fmt.Println(response)
 		}
-		data, err := json.MarshalIndent(result, "", "  ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error marshaling JSON: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println(string(data))
-	} else {
-		if agentThinking != "off" {
-			fmt.Println("\n💡 Response:")
-		}
-		fmt.Println(response)
 	}
 
 	// Deliver through channel if requested
 	if agentDeliver && !agentLocal {
 		if err := deliverResponse(ctx, messageBus, response); err != nil && agentVerbose {
 			fmt.Fprintf(os.Stderr, "Warning: Failed to deliver response: %v\n", err)
+		}
+	}
+}
+
+// handleStreamingOutput handles streaming output from agent events
+func handleStreamingOutput(ctx context.Context, eventChan <-chan *agent.Event, messageBus *bus.MessageBus, thinkingLevel string) string {
+	var fullContent, thinkingContent, finalContent strings.Builder
+	inThinking := false
+	inFinal := false
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println() // Ensure newline on interrupt
+			return fullContent.String()
+		case event, ok := <-eventChan:
+			if !ok {
+				// Channel closed, output any remaining content
+				if finalContent.Len() > 0 {
+					fmt.Print(finalContent.String())
+				}
+				fmt.Println()
+				return fullContent.String()
+			}
+
+			switch event.Type {
+			case agent.EventStreamContent:
+				content := event.StreamContent
+				fullContent.WriteString(content)
+				if !inThinking && !inFinal {
+					fmt.Print(content)
+				}
+
+			case agent.EventStreamThinking:
+				thinkingContent.WriteString(event.StreamContent)
+				if thinkingLevel != "off" && !inThinking {
+					inThinking = true
+					fmt.Print("\n🤔 Thinking: ")
+				}
+				if thinkingLevel != "off" {
+					fmt.Print(event.StreamContent)
+				}
+
+			case agent.EventStreamFinal:
+				finalContent.WriteString(event.StreamContent)
+				if !inFinal {
+					inFinal = true
+					if inThinking {
+						fmt.Print("\n")
+					}
+					fmt.Print("\n📤 Final: ")
+				}
+				fmt.Print(event.StreamContent)
+
+			case agent.EventStreamDone:
+				// Stream complete, wait for final response
+				inThinking = false
+				inFinal = false
+
+			case agent.EventToolExecutionStart:
+				fmt.Printf("\n🔧 Tool: %s\n", event.ToolName)
+
+			case agent.EventToolExecutionEnd:
+				if event.ToolError {
+					fmt.Printf("   ❌ Error\n")
+				} else {
+					fmt.Printf("   ✅ Done\n")
+				}
+
+			case agent.EventAgentEnd:
+				// Agent finished, output newline and return
+				fmt.Println()
+				return fullContent.String()
+			}
 		}
 	}
 }

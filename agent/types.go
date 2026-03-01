@@ -144,6 +144,11 @@ const (
 	EventToolExecutionStart  EventType = "tool_execution_start"
 	EventToolExecutionUpdate EventType = "tool_execution_update"
 	EventToolExecutionEnd    EventType = "tool_execution_end"
+	// Streaming events
+	EventStreamContent  EventType = "stream_content"
+	EventStreamThinking EventType = "stream_thinking"
+	EventStreamFinal    EventType = "stream_final"
+	EventStreamDone     EventType = "stream_done"
 )
 
 // Event represents an event from the agent
@@ -162,6 +167,8 @@ type Event struct {
 	FinalMessages []AgentMessage `json:"final_messages,omitempty"`
 	// Message update event
 	AssistantMessageEvent interface{} `json:"assistant_message_event,omitempty"`
+	// Streaming fields
+	StreamContent string `json:"stream_content,omitempty"`
 }
 
 // LoopConfig contains configuration for the agent loop

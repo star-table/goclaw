@@ -252,6 +252,12 @@ func (o *Orchestrator) streamAssistantResponse(ctx context.Context, state *Agent
 		zap.Int("tools_count", len(toolDefs)),
 		zap.Bool("has_loaded_skills", len(state.LoadedSkills) > 0))
 
+	// Try streaming if provider supports it
+	if sp, ok := o.config.Provider.(providers.StreamingProvider); ok {
+		return o.callWithStreaming(ctx, sp, fullMessages, toolDefs)
+	}
+
+	// Fallback to non-streaming
 	response, err := o.config.Provider.Chat(ctx, fullMessages, toolDefs)
 	if err != nil {
 		logger.Error("LLM call failed", zap.Error(err))
@@ -272,6 +278,100 @@ func (o *Orchestrator) streamAssistantResponse(ctx context.Context, state *Agent
 	logger.Debug("=== streamAssistantResponse End ===",
 		zap.Bool("has_tool_calls", len(response.ToolCalls) > 0),
 		zap.Int("tool_calls_count", len(response.ToolCalls)))
+
+	return assistantMsg, nil
+}
+
+// callWithStreaming calls the LLM with streaming support
+func (o *Orchestrator) callWithStreaming(ctx context.Context, sp providers.StreamingProvider, messages []providers.Message, tools []providers.ToolDefinition) (AgentMessage, error) {
+	var contentBuilder, thinkingBuilder, finalBuilder strings.Builder
+	var toolCalls []providers.ToolCall
+	var streamErr error
+
+	err := sp.ChatStream(ctx, messages, tools, func(chunk providers.StreamChunk) {
+		if chunk.Error != nil {
+			streamErr = chunk.Error
+			return
+		}
+
+		// Handle different chunk types
+		if chunk.ToolCall != nil {
+			toolCalls = append(toolCalls, *chunk.ToolCall)
+		} else if chunk.IsThinking {
+			thinkingBuilder.WriteString(chunk.Content)
+			// Emit thinking stream event
+			o.emit(&Event{
+				Type:          EventStreamThinking,
+				StreamContent: chunk.Content,
+				Timestamp:     time.Now().UnixMilli(),
+			})
+		} else if chunk.IsFinal {
+			finalBuilder.WriteString(chunk.Content)
+			// Emit final stream event
+			o.emit(&Event{
+				Type:          EventStreamFinal,
+				StreamContent: chunk.Content,
+				Timestamp:     time.Now().UnixMilli(),
+			})
+		} else if chunk.Content != "" {
+			contentBuilder.WriteString(chunk.Content)
+			// Emit content stream event
+			o.emit(&Event{
+				Type:          EventStreamContent,
+				StreamContent: chunk.Content,
+				Timestamp:     time.Now().UnixMilli(),
+			})
+		}
+
+		// Emit done event when stream completes
+		if chunk.Done {
+			o.emit(&Event{
+				Type:      EventStreamDone,
+				Timestamp: time.Now().UnixMilli(),
+			})
+		}
+	})
+
+	if err != nil {
+		logger.Error("LLM streaming call failed", zap.Error(err))
+		return AgentMessage{}, fmt.Errorf("LLM streaming call failed: %w", err)
+	}
+	if streamErr != nil {
+		return AgentMessage{}, streamErr
+	}
+
+	// Build final content (thinking + content + final)
+	var fullContent strings.Builder
+	if thinkingBuilder.Len() > 0 {
+		fullContent.WriteString("<thinking>")
+		fullContent.WriteString(thinkingBuilder.String())
+		fullContent.WriteString("</thinking>")
+	}
+	fullContent.WriteString(contentBuilder.String())
+	if finalBuilder.Len() > 0 {
+		fullContent.WriteString("<final>")
+		fullContent.WriteString(finalBuilder.String())
+		fullContent.WriteString("</final>")
+	}
+
+	response := &providers.Response{
+		Content:      fullContent.String(),
+		ToolCalls:    toolCalls,
+		FinishReason: "stop",
+	}
+
+	logger.Info("=== LLM Streaming Response Complete ===",
+		zap.Int("content_length", fullContent.Len()),
+		zap.Int("tool_calls_count", len(toolCalls)))
+
+	// Emit message end
+	o.emit(NewEvent(EventMessageEnd))
+
+	assistantMsg := convertFromProviderResponse(response)
+
+	logger.Debug("=== streamAssistantResponse End ===",
+		zap.Bool("has_tool_calls", len(toolCalls) > 0),
+		zap.Int("tool_calls_count", len(toolCalls)))
 
 	return assistantMsg, nil
 }
