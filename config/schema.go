@@ -158,7 +158,10 @@ type FeishuChannelConfig struct {
 	WebhookPort       int      `mapstructure:"webhook_port" json:"webhook_port"`
 	Domain            string   `mapstructure:"domain" json:"domain"`             // 飞书域名 (如: feishu, lark)
 	GroupPolicy       string   `mapstructure:"group_policy" json:"group_policy"` // 群聊策略: open, closed, whitelist
+	DMPolicy          string   `mapstructure:"dm_policy" json:"dm_policy"`       // 私聊策略: open, pairing, allowlist, closed (默认: pairing)
 	AllowedIDs        []string `mapstructure:"allowed_ids" json:"allowed_ids"`
+	// CronOutputChatID 指定 cron 任务输出的目标聊天 ID（用于接收定时任务的通知）
+	CronOutputChatID  string   `mapstructure:"cron_output_chat_id" json:"cron_output_chat_id"`
 	// 多账号配置（新格式）
 	Accounts map[string]ChannelAccountConfig `mapstructure:"accounts" json:"accounts"`
 }

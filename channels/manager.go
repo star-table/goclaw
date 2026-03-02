@@ -234,6 +234,29 @@ func (m *Manager) DispatchOutbound(ctx context.Context) error {
 				zap.String("chat_id", msg.ChatID),
 				zap.Int("content_length", len(msg.Content)))
 
+			// 特殊处理 cron 消息：如果 chat_id 为空，尝试路由到配置的飞书聊天
+			if msg.Channel == "cron" && msg.ChatID == "" {
+				// 查找飞书通道的 cron_output_chat_id 配置
+				if feishuChannel, ok := m.Get("feishu"); ok {
+					if fc, ok := feishuChannel.(interface{ GetCronOutputChatID() string }); ok {
+						cronChatID := fc.GetCronOutputChatID()
+						if cronChatID != "" {
+							msg.ChatID = cronChatID
+							msg.Channel = "feishu"
+							logger.Info("Routed cron message to configured Feishu chat",
+								zap.String("cron_chat_id", cronChatID))
+						}
+					}
+				}
+			}
+
+			// 如果仍然没有 chat_id，跳过此消息
+			if msg.ChatID == "" {
+				logger.Warn("Outbound message has no chat_id, skipping",
+					zap.String("channel", msg.Channel))
+				continue
+			}
+
 			// 查找对应的通道
 			channel, ok := m.Get(msg.Channel)
 			if !ok {

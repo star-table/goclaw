@@ -21,6 +21,7 @@ import (
 	"github.com/smallnest/goclaw/bus"
 	"github.com/smallnest/goclaw/config"
 	"github.com/smallnest/goclaw/internal/logger"
+	"github.com/smallnest/goclaw/pairing"
 	"go.uber.org/zap"
 )
 
@@ -32,6 +33,7 @@ type FeishuChannel struct {
 	domain            string
 	encryptKey        string
 	verificationToken string
+	dmPolicy          string // DM policy: open, pairing, allowlist, closed
 	wsClient          *larkws.Client
 	eventDispatcher   *dispatcher.EventDispatcher
 	httpClient        *lark.Client
@@ -40,6 +42,9 @@ type FeishuChannel struct {
 	typingReactionsMu sync.RWMutex
 	// bot open_id for mention checking
 	botOpenId string
+	// pairing store for DM access control
+	pairingStore    *pairing.PairingStore
+	cronOutputChatID string // cron output target chat ID
 }
 
 // NewFeishuChannel 创建飞书通道
@@ -61,6 +66,26 @@ func NewFeishuChannel(cfg config.FeishuChannelConfig, bus *bus.MessageBus) (*Fei
 		AllowedIDs: cfg.AllowedIDs,
 	}
 
+	// Resolve DM policy (default to "pairing" for security)
+	dmPolicy := cfg.DMPolicy
+	if dmPolicy == "" {
+		dmPolicy = "pairing"
+	}
+
+	// Create pairing store if policy is "pairing"
+	var pairingStore *pairing.PairingStore
+	if dmPolicy == "pairing" {
+		var err error
+		pairingStore, err = pairing.NewPairingStore(pairing.Config{
+			Channel:   "feishu",
+			AccountID: "", // default account
+		})
+		if err != nil {
+			logger.Warn("Failed to create pairing store, pairing disabled", zap.Error(err))
+			dmPolicy = "allowlist" // fallback to allowlist mode
+		}
+	}
+
 	return &FeishuChannel{
 		BaseChannelImpl:   NewBaseChannelImpl("feishu", "default", baseCfg, bus),
 		appID:             cfg.AppID,
@@ -68,8 +93,11 @@ func NewFeishuChannel(cfg config.FeishuChannelConfig, bus *bus.MessageBus) (*Fei
 		domain:            cfg.Domain,
 		encryptKey:        cfg.EncryptKey,
 		verificationToken: cfg.VerificationToken,
+		dmPolicy:          dmPolicy,
 		httpClient:        client,
 		typingReactions:   make(map[string]string),
+		pairingStore:      pairingStore,
+		cronOutputChatID:   cfg.CronOutputChatID,
 	}, nil
 }
 
@@ -289,13 +317,23 @@ func (c *FeishuChannel) handleMessageReceived(ctx context.Context, event *larkim
 		zap.Int("mentions_count", len(event.Event.Message.Mentions)),
 	)
 
-	// 检查发送者权限
-	if senderID != "" && !c.IsAllowed(senderID) {
-		return
-	}
-
 	// 检查群聊消息是否 @ 了机器人
 	isGroupChat := chatType == "group"
+
+	// 对于私聊消息，检查 DM Policy 和配对状态
+	if !isGroupChat && senderID != "" {
+		allowed := c.checkDMPolicy(senderID)
+		if !allowed {
+			return
+		}
+	}
+
+	// 对于群聊消息，检查是否在 allowed_ids 中（如果配置了）
+	if isGroupChat {
+		if senderID != "" && !c.IsAllowed(senderID) {
+			return
+		}
+	}
 
 	if isGroupChat {
 		if c.botOpenId == "" {
@@ -789,11 +827,6 @@ func (c *FeishuChannel) sendCardMessage(msg *bus.OutboundMessage, receiveIDType 
 	return nil
 }
 
-// jsonEscape 转义 JSON 字符串
-func jsonEscape(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b)
-}
 
 // Stop 停止飞书通道
 func (c *FeishuChannel) Stop() error {
@@ -812,3 +845,144 @@ func getStringPtr(s *string) string {
 	}
 	return *s
 }
+
+// checkDMPolicy 检查私聊消息的发送者是否允许根据 DM Policy
+// 返回 true 表示允许处理消息，false 表示拒绝
+func (c *FeishuChannel) checkDMPolicy(senderID string) bool {
+	// 首先检查配置的 allowed_ids（白名单优先）
+	if len(c.config.AllowedIDs) > 0 {
+		for _, id := range c.config.AllowedIDs {
+			if id == senderID {
+				return true
+			}
+		}
+	}
+
+	// 根据 dm_policy 决定
+	switch c.dmPolicy {
+	case "open":
+		// 允许所有发送者
+		return true
+
+	case "closed":
+		// 拒绝所有私聊消息
+		logger.Info("[Feishu] DM closed, blocking message",
+			zap.String("sender_id", senderID))
+		return false
+
+	case "allowlist":
+		// 只允许在 allowed_ids 中的发送者
+		// 上面已经检查过了，如果到这里说明不在列表中
+		logger.Info("[Feishu] Sender not in allowlist",
+			zap.String("sender_id", senderID))
+		return false
+
+	case "pairing":
+		// 检查配对状态
+		if c.pairingStore == nil {
+			// 配对存储不可用，回退到 allowlist 模式
+			logger.Info("[Feishu] Pairing store unavailable, blocking message",
+				zap.String("sender_id", senderID))
+			return false
+		}
+
+		// 检查是否已配对
+		if c.pairingStore.IsAllowed(senderID) {
+			return true
+		}
+
+		// 未配对，创建配对请求并发送配对码
+		logger.Info("[Feishu] Unpaired sender, creating pairing request",
+			zap.String("sender_id", senderID))
+
+		code, created, err := c.pairingStore.UpsertRequest(senderID, "")
+		if err != nil {
+			logger.Error("Failed to create pairing request",
+				zap.String("sender_id", senderID),
+				zap.Error(err))
+			return false
+		}
+
+		if created {
+			// 发送配对码消息
+			idLine := fmt.Sprintf("Your Feishu user id: %s", senderID)
+			replyMsg := pairing.BuildPairingReply("feishu", idLine, code)
+
+			// 发送私聊消息
+			if err := c.sendPrivateMessage(senderID, replyMsg); err != nil {
+				logger.Error("Failed to send pairing message",
+					zap.String("sender_id", senderID),
+					zap.Error(err))
+			} else {
+				logger.Info("[Feishu] Sent pairing message",
+					zap.String("sender_id", senderID),
+					zap.String("code", code))
+			}
+		} else {
+			logger.Info("[Feishu] Pairing request already exists",
+				zap.String("sender_id", senderID),
+				zap.String("code", code))
+		}
+
+		return false
+
+	default:
+		// 未知的 policy，默认拒绝
+		logger.Warn("[Feishu] Unknown dm_policy, blocking message",
+			zap.String("policy", c.dmPolicy),
+			zap.String("sender_id", senderID))
+		return false
+	}
+}
+
+// sendPrivateMessage 发送私聊消息
+func (c *FeishuChannel) sendPrivateMessage(userID, message string) error {
+	// 构建卡片消息
+	cardContent := fmt.Sprintf(`{
+		"schema": "2.0",
+		"config": {
+			"wide_screen_mode": true
+		},
+		"body": {
+			"elements": [
+				{
+					"tag": "markdown",
+					"content": %s
+				}
+			]
+		}
+	}`, jsonEscape(message))
+
+	req := larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType(larkim.ReceiveIdTypeOpenId).
+		Body(larkim.NewCreateMessageReqBodyBuilder().
+			ReceiveId(userID).
+			MsgType(larkim.MsgTypeInteractive).
+			Content(cardContent).
+			Build()).
+		Build()
+
+	ctx := context.Background()
+	resp, err := c.httpClient.Im.Message.Create(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed to send message: %w", err)
+	}
+
+	if !resp.Success() {
+		return fmt.Errorf("feishu api error: %d %s", resp.Code, resp.Msg)
+	}
+
+	return nil
+}
+
+// jsonEscape 转义 JSON 字符串
+func jsonEscape(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// GetCronOutputChatID 返回 cron 输出的目标聊天 ID
+func (c *FeishuChannel) GetCronOutputChatID() string {
+	return c.cronOutputChatID
+}
+
