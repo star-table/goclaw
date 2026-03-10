@@ -40,3 +40,7 @@ config.json
 google_search_results.json
 
 .history
+internal/builtin_skills
+console/示例
+main
+server
