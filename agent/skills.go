@@ -10,12 +10,55 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/smallnest/goclaw/internal/logger"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
+
+// SkillFileTree 技能文件树结构
+type SkillFileTree struct {
+	Name     string           `json:"name"`
+	Type     string           `json:"type"` // "file" or "directory"
+	Children []*SkillFileTree `json:"children,omitempty"`
+}
+
+// SkillError 技能错误类型
+type SkillError struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+	Detail  string `json:"detail,omitempty"`
+	Skill   string `json:"skill,omitempty"`
+}
+
+func (e *SkillError) Error() string {
+	if e.Skill != "" {
+		return fmt.Sprintf("[%s] %s: %s", e.Type, e.Skill, e.Message)
+	}
+	return fmt.Sprintf("[%s] %s", e.Type, e.Message)
+}
+
+// 错误类型常量
+const (
+	SkillErrorNotFound       = "SKILL_NOT_FOUND"
+	SkillErrorLoadFailed     = "SKILL_LOAD_FAILED"
+	SkillErrorMissingDeps    = "SKILL_MISSING_DEPS"
+	SkillErrorInstallFailed  = "SKILL_INSTALL_FAILED"
+	SkillErrorInvalidConfig  = "SKILL_INVALID_CONFIG"
+	SkillErrorOSNotSupported = "SKILL_OS_NOT_SUPPORTED"
+)
+
+// NewSkillError 创建技能错误
+func NewSkillError(errType, message, detail, skill string) *SkillError {
+	return &SkillError{
+		Type:    errType,
+		Message: message,
+		Detail:  detail,
+		Skill:   skill,
+	}
+}
 
 // Skill 技能定义
 type Skill struct {
@@ -25,6 +68,7 @@ type Skill struct {
 	Author      string `yaml:"author"`
 	Homepage    string `yaml:"homepage"`
 	Always      bool   `yaml:"always"`
+	Source      string `yaml:"-"` // 技能来源: builtin, customized, active
 	Metadata    struct {
 		OpenClaw struct {
 			Emoji    string `yaml:"emoji"`
@@ -45,6 +89,9 @@ type Skill struct {
 	Content  string            `yaml:"-"`        // 技能内容（Markdown）
 	// 缺失的依赖信息
 	MissingDeps *MissingDeps `yaml:"-"` // 解析时填充
+	// 文件树结构
+	References *SkillFileTree `json:"references,omitempty"` // references 目录树
+	Scripts    *SkillFileTree `json:"scripts,omitempty"`    // scripts 目录树
 }
 
 // MissingDeps 缺失的依赖信息
@@ -82,6 +129,10 @@ type SkillsLoader struct {
 	alwaysSkills   []string
 	autoInstall    bool          // 是否启用自动安装依赖
 	installTimeout time.Duration // 安装超时时间
+	// 热重载相关
+	watcher        *SkillWatcher        // 技能文件监听器
+	onSkillChanged func(string, string) // 技能变化回调 (skillName, action)
+	mu             sync.RWMutex         // 保护 skills 并发访问
 }
 
 // Default installation timeout
@@ -112,10 +163,13 @@ func (l *SkillsLoader) SetInstallTimeout(timeout time.Duration) {
 
 // Discover 发现技能
 // 按照顺序加载技能，后加载的同名技能会覆盖前面的
+// 支持多目录来源：builtin -> customized -> active
 func (l *SkillsLoader) Discover() error {
 	// 按照配置的技能目录顺序加载（后面的会覆盖前面的）
-	for _, dir := range l.skillsDirs {
-		if err := l.discoverInDir(dir); err != nil {
+	for idx, dir := range l.skillsDirs {
+		// 确定来源类型
+		source := l.detectSourceType(dir, idx)
+		if err := l.discoverInDir(dir, source); err != nil {
 			// 目录不存在是正常的，继续
 			if !os.IsNotExist(err) {
 				logger.Warn("Failed to discover skills in directory",
@@ -128,8 +182,25 @@ func (l *SkillsLoader) Discover() error {
 	return nil
 }
 
+// detectSourceType 根据目录路径和索引确定skill来源类型
+func (l *SkillsLoader) detectSourceType(dir string, idx int) string {
+	// 根据目录名判断
+	base := filepath.Base(dir)
+	if base == "active_skills" || strings.Contains(dir, "active_skills") {
+		return "active"
+	}
+	if base == "builtin_skills" || strings.Contains(dir, "builtin") {
+		return "builtin"
+	}
+	// 默认第一个目录是builtin，其他是customized
+	if idx == 0 {
+		return "builtin"
+	}
+	return "customized"
+}
+
 // discoverInDir 在目录中发现技能
-func (l *SkillsLoader) discoverInDir(dir string) error {
+func (l *SkillsLoader) discoverInDir(dir string, source string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return err
@@ -142,7 +213,7 @@ func (l *SkillsLoader) discoverInDir(dir string) error {
 		}
 
 		skillPath := filepath.Join(dir, entry.Name())
-		if err := l.loadSkill(skillPath); err != nil {
+		if err := l.loadSkill(skillPath, source); err != nil {
 			// 跳过无法加载的技能
 			continue
 		}
@@ -152,7 +223,7 @@ func (l *SkillsLoader) discoverInDir(dir string) error {
 }
 
 // loadSkill 加载技能
-func (l *SkillsLoader) loadSkill(path string) error {
+func (l *SkillsLoader) loadSkill(path string, source string) error {
 	// 查找 SKILL.md 或 skill.md
 	skillFile := filepath.Join(path, "SKILL.md")
 	if _, err := os.Stat(skillFile); os.IsNotExist(err) {
@@ -193,6 +264,20 @@ func (l *SkillsLoader) loadSkill(path string) error {
 		skill.Name = filepath.Base(path)
 	}
 
+	// 设置来源
+	skill.Source = source
+
+	// 构建文件树结构
+	refsPath := filepath.Join(path, "references")
+	if _, err := os.Stat(refsPath); err == nil {
+		skill.References = l.buildFileTree(refsPath)
+	}
+
+	scriptsPath := filepath.Join(path, "scripts")
+	if _, err := os.Stat(scriptsPath); err == nil {
+		skill.Scripts = l.buildFileTree(scriptsPath)
+	}
+
 	l.skills[skill.Name] = &skill
 
 	// 记录 always 技能
@@ -201,6 +286,40 @@ func (l *SkillsLoader) loadSkill(path string) error {
 	}
 
 	return nil
+}
+
+// buildFileTree 构建目录的文件树结构
+func (l *SkillsLoader) buildFileTree(rootPath string) *SkillFileTree {
+	root := &SkillFileTree{
+		Name: filepath.Base(rootPath),
+		Type: "directory",
+	}
+
+	entries, err := os.ReadDir(rootPath)
+	if err != nil {
+		return root
+	}
+
+	for _, entry := range entries {
+		child := l.buildFileTreeEntry(filepath.Join(rootPath, entry.Name()), entry)
+		if child != nil {
+			root.Children = append(root.Children, child)
+		}
+	}
+
+	return root
+}
+
+// buildFileTreeEntry 递归构建文件树条目
+func (l *SkillsLoader) buildFileTreeEntry(fullPath string, entry os.DirEntry) *SkillFileTree {
+	if entry.IsDir() {
+		return l.buildFileTree(fullPath)
+	}
+
+	return &SkillFileTree{
+		Name: entry.Name(),
+		Type: "file",
+	}
 }
 
 // checkBlockingRequirements 检查阻塞性需求（如 OS 不匹配）
@@ -322,6 +441,9 @@ func (l *SkillsLoader) extractContent(content string) string {
 
 // List 列出所有技能
 func (l *SkillsLoader) List() []*Skill {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
 	result := make([]*Skill, 0, len(l.skills))
 	for _, skill := range l.skills {
 		result = append(result, skill)
@@ -331,12 +453,18 @@ func (l *SkillsLoader) List() []*Skill {
 
 // Get 获取技能
 func (l *SkillsLoader) Get(name string) (*Skill, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
 	skill, ok := l.skills[name]
 	return skill, ok
 }
 
 // GetAlwaysSkills 获取始终加载的技能
 func (l *SkillsLoader) GetAlwaysSkills() []string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
 	return l.alwaysSkills
 }
 
@@ -370,7 +498,12 @@ func (l *SkillsLoader) BuildSummary() string {
 func (l *SkillsLoader) LoadContent(name string) (string, error) {
 	skill, ok := l.skills[name]
 	if !ok {
-		return "", fmt.Errorf("skill not found: %s", name)
+		return "", NewSkillError(
+			SkillErrorNotFound,
+			fmt.Sprintf("技能 '%s' 未找到", name),
+			fmt.Sprintf("请检查技能名称是否正确，或运行 'goclaw skills list' 查看可用技能"),
+			name,
+		)
 	}
 
 	return skill.Content, nil
@@ -380,14 +513,24 @@ func (l *SkillsLoader) LoadContent(name string) (string, error) {
 func (l *SkillsLoader) InstallDependencies(skillName string) error {
 	skill, ok := l.skills[skillName]
 	if !ok {
-		return fmt.Errorf("skill not found: %s", skillName)
+		return NewSkillError(
+			SkillErrorNotFound,
+			fmt.Sprintf("技能 '%s' 未找到", skillName),
+			"请检查技能名称是否正确",
+			skillName,
+		)
 	}
 
 	// 检查二进制依赖并安装
 	for _, bin := range skill.Metadata.OpenClaw.Requires.Bins {
 		if _, err := exec.LookPath(bin); err != nil {
 			if err := l.tryInstallBinary(skill, bin); err != nil {
-				return fmt.Errorf("failed to install %s for skill %s: %w", bin, skillName, err)
+				return NewSkillError(
+					SkillErrorInstallFailed,
+					fmt.Sprintf("安装依赖 '%s' 失败", bin),
+					fmt.Sprintf("请手动安装 '%s' 或检查安装配置\n原始错误: %v", bin, err),
+					skillName,
+				)
 			}
 		}
 	}
@@ -409,7 +552,12 @@ func (l *SkillsLoader) InstallDependencies(skillName string) error {
 	for _, pkg := range skill.Metadata.OpenClaw.Requires.PythonPkgs {
 		if err := l.checkPythonPackage(pkg); err != nil {
 			if err := l.tryInstallPythonPackage(pkg); err != nil {
-				return fmt.Errorf("failed to install Python package %s for skill %s: %w", pkg, skillName, err)
+				return NewSkillError(
+					SkillErrorInstallFailed,
+					fmt.Sprintf("安装 Python 包 '%s' 失败", pkg),
+					fmt.Sprintf("请运行 'pip install %s' 手动安装\n原始错误: %v", pkg, err),
+					skillName,
+				)
 			}
 		}
 	}
@@ -418,7 +566,12 @@ func (l *SkillsLoader) InstallDependencies(skillName string) error {
 	for _, pkg := range skill.Metadata.OpenClaw.Requires.NodePkgs {
 		if err := l.checkNodePackage(pkg); err != nil {
 			if err := l.tryInstallNodePackage(pkg); err != nil {
-				return fmt.Errorf("failed to install Node.js package %s for skill %s: %w", pkg, skillName, err)
+				return NewSkillError(
+					SkillErrorInstallFailed,
+					fmt.Sprintf("安装 Node.js 包 '%s' 失败", pkg),
+					fmt.Sprintf("请运行 'npm install -g %s' 手动安装\n原始错误: %v", pkg, err),
+					skillName,
+				)
 			}
 		}
 	}
@@ -430,7 +583,12 @@ func (l *SkillsLoader) InstallDependencies(skillName string) error {
 func (l *SkillsLoader) tryInstallBinary(skill *Skill, bin string) error {
 	installConfig := l.findInstallConfig(skill, bin)
 	if installConfig == nil {
-		return fmt.Errorf("no install config for %s", bin)
+		return NewSkillError(
+			SkillErrorInstallFailed,
+			fmt.Sprintf("未找到 '%s' 的安装配置", bin),
+			fmt.Sprintf("技能 '%s' 声明需要 '%s'，但未提供安装配置。请手动安装 '%s'", skill.Name, bin, bin),
+			skill.Name,
+		)
 	}
 
 	// 检查操作系统是否匹配
@@ -444,13 +602,23 @@ func (l *SkillsLoader) tryInstallBinary(skill *Skill, bin string) error {
 			}
 		}
 		if !matches {
-			return fmt.Errorf("install not supported on %s", currentOS)
+			return NewSkillError(
+				SkillErrorOSNotSupported,
+				fmt.Sprintf("'%s' 不支持当前操作系统 '%s'", bin, currentOS),
+				fmt.Sprintf("该依赖仅支持以下系统: %v", installConfig.OS),
+				skill.Name,
+			)
 		}
 	}
 
 	// 获取用户确认
 	if !l.confirmInstall(skill.Name, installConfig) {
-		return fmt.Errorf("install cancelled by user")
+		return NewSkillError(
+			SkillErrorInstallFailed,
+			"用户取消了安装",
+			"",
+			skill.Name,
+		)
 	}
 
 	logger.Info("Installing dependency for skill",
@@ -488,7 +656,12 @@ func (l *SkillsLoader) tryInstallBinary(skill *Skill, bin string) error {
 	case "command":
 		cmd = exec.Command("sh", "-c", installConfig.Command)
 	default:
-		return fmt.Errorf("unsupported install kind: %s", installConfig.Kind)
+		return NewSkillError(
+			SkillErrorInstallFailed,
+			fmt.Sprintf("不支持的安装方式 '%s'", installConfig.Kind),
+			fmt.Sprintf("技能 '%s' 配置了未知的安装方式 '%s'", skill.Name, installConfig.Kind),
+			skill.Name,
+		)
 	}
 
 	// 执行安装，带超时
@@ -498,7 +671,12 @@ func (l *SkillsLoader) tryInstallBinary(skill *Skill, bin string) error {
 	output, err := cmd.CombinedOutput()
 	_ = ctx // 避免未使用警告
 	if err != nil {
-		return fmt.Errorf("install failed: %w, output: %s", err, string(output))
+		return NewSkillError(
+			SkillErrorInstallFailed,
+			fmt.Sprintf("安装命令执行失败"),
+			fmt.Sprintf("命令: %s\n错误: %v\n输出: %s", cmd.String(), err, string(output)),
+			skill.Name,
+		)
 	}
 
 	// 刷新PATH

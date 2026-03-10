@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/smallnest/goclaw/internal/logger"
 	"github.com/smallnest/goclaw/providers"
 	"go.uber.org/zap"
@@ -322,6 +323,7 @@ func (o *Orchestrator) callWithStreaming(ctx context.Context, sp providers.Strea
 			thinkingBuilder.WriteString(chunk.Content)
 			// Emit thinking stream event
 			o.emit(&Event{
+				ID:            uuid.New().String(),
 				Type:          EventStreamThinking,
 				StreamContent: chunk.Content,
 				Timestamp:     time.Now().UnixMilli(),
@@ -330,6 +332,7 @@ func (o *Orchestrator) callWithStreaming(ctx context.Context, sp providers.Strea
 			finalBuilder.WriteString(chunk.Content)
 			// Emit final stream event
 			o.emit(&Event{
+				ID:            uuid.New().String(),
 				Type:          EventStreamFinal,
 				StreamContent: chunk.Content,
 				Timestamp:     time.Now().UnixMilli(),
@@ -338,6 +341,7 @@ func (o *Orchestrator) callWithStreaming(ctx context.Context, sp providers.Strea
 			contentBuilder.WriteString(chunk.Content)
 			// Emit content stream event
 			o.emit(&Event{
+				ID:            uuid.New().String(),
 				Type:          EventStreamContent,
 				StreamContent: chunk.Content,
 				Timestamp:     time.Now().UnixMilli(),
@@ -347,6 +351,7 @@ func (o *Orchestrator) callWithStreaming(ctx context.Context, sp providers.Strea
 		// Emit done event when stream completes
 		if chunk.Done {
 			o.emit(&Event{
+				ID:        uuid.New().String(),
 				Type:      EventStreamDone,
 				Timestamp: time.Now().UnixMilli(),
 			})

@@ -31,12 +31,15 @@ func (t *FileSystemTool) ReadFile(ctx context.Context, params map[string]interfa
 		return "", fmt.Errorf("path parameter is required")
 	}
 
+	// 解析为绝对路径（相对于工作区）
+	absPath := t.resolvePath(path)
+
 	// 检查路径权限
-	if !t.isAllowed(path) {
-		return "", fmt.Errorf("access to path %s is not allowed", path)
+	if !t.isAllowed(absPath) {
+		return "", fmt.Errorf("access to path %s is not allowed", absPath)
 	}
 
-	content, err := os.ReadFile(path)
+	content, err := os.ReadFile(absPath)
 	if err != nil {
 		return "", err
 	}
@@ -56,23 +59,26 @@ func (t *FileSystemTool) WriteFile(ctx context.Context, params map[string]interf
 		return "", fmt.Errorf("content parameter is required")
 	}
 
+	// 解析为绝对路径（相对于工作区）
+	absPath := t.resolvePath(path)
+
 	// 检查路径权限
-	if !t.isAllowed(path) {
-		return "", fmt.Errorf("access to path %s is not allowed", path)
+	if !t.isAllowed(absPath) {
+		return "", fmt.Errorf("access to path %s is not allowed", absPath)
 	}
 
 	// 确保目录存在
-	dir := filepath.Dir(path)
+	dir := filepath.Dir(absPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
 	}
 
 	// 写入文件
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(absPath, []byte(content), 0644); err != nil {
 		return "", err
 	}
 
-	return fmt.Sprintf("Successfully wrote %d bytes to %s", len(content), path), nil
+	return fmt.Sprintf("Successfully wrote %d bytes to %s", len(content), absPath), nil
 }
 
 // EditFile 编辑文件（精确字符串替换）
@@ -92,13 +98,16 @@ func (t *FileSystemTool) EditFile(ctx context.Context, params map[string]interfa
 		return "", fmt.Errorf("new_string parameter is required")
 	}
 
+	// 解析为绝对路径（相对于工作区）
+	absPath := t.resolvePath(path)
+
 	// 检查路径权限
-	if !t.isAllowed(path) {
-		return "", fmt.Errorf("access to path %s is not allowed", path)
+	if !t.isAllowed(absPath) {
+		return "", fmt.Errorf("access to path %s is not allowed", absPath)
 	}
 
 	// 读取文件内容
-	content, err := os.ReadFile(path)
+	content, err := os.ReadFile(absPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read file: %w", err)
 	}
@@ -117,11 +126,11 @@ func (t *FileSystemTool) EditFile(ctx context.Context, params map[string]interfa
 	newContent := strings.ReplaceAll(fileContent, oldStr, newStr)
 
 	// 写入文件
-	if err := os.WriteFile(path, []byte(newContent), 0644); err != nil {
+	if err := os.WriteFile(absPath, []byte(newContent), 0644); err != nil {
 		return "", fmt.Errorf("failed to write file: %w", err)
 	}
 
-	return fmt.Sprintf("Successfully replaced %d occurrence(s) in %s", occurrences, path), nil
+	return fmt.Sprintf("Successfully replaced %d occurrence(s) in %s", occurrences, absPath), nil
 }
 
 // ListDir 列出目录
@@ -131,12 +140,15 @@ func (t *FileSystemTool) ListDir(ctx context.Context, params map[string]interfac
 		return "", fmt.Errorf("path parameter is required")
 	}
 
+	// 解析为绝对路径（相对于工作区）
+	absPath := t.resolvePath(path)
+
 	// 检查路径权限
-	if !t.isAllowed(path) {
-		return "", fmt.Errorf("access to path %s is not allowed", path)
+	if !t.isAllowed(absPath) {
+		return "", fmt.Errorf("access to path %s is not allowed", absPath)
 	}
 
-	entries, err := os.ReadDir(path)
+	entries, err := os.ReadDir(absPath)
 	if err != nil {
 		return "", err
 	}
@@ -182,6 +194,19 @@ func (t *FileSystemTool) isAllowed(path string) bool {
 	}
 
 	return false
+}
+
+// resolvePath 解析路径为绝对路径
+// 如果是相对路径，则相对于工作区的 workspace 子目录解析
+func (t *FileSystemTool) resolvePath(path string) string {
+	// 如果已经是绝对路径，直接返回
+	if filepath.IsAbs(path) {
+		return path
+	}
+
+	// 使用 workspace/files 作为默认文件存储目录
+	filesDir := filepath.Join(t.workspace, "workspace")
+	return filepath.Join(filesDir, path)
 }
 
 // UpdateConfig 更新配置文件

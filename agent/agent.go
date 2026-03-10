@@ -349,7 +349,7 @@ func (a *Agent) publishToBus(ctx context.Context, channel, chatID string, msg Ag
 // Returns a read-only channel. Call Unsubscribe to clean up.
 // IMPORTANT: Always call Unsubscribe when done to prevent memory leaks.
 func (a *Agent) Subscribe() <-chan *Event {
-	ch := make(chan *Event, 10)
+	ch := make(chan *Event, 100)
 
 	a.mu.Lock()
 	a.eventSubs = append(a.eventSubs, ch)

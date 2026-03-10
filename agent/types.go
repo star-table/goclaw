@@ -153,6 +153,7 @@ const (
 
 // Event represents an event from the agent
 type Event struct {
+	ID        string        `json:"id"`
 	Type      EventType     `json:"type"`
 	Message   *AgentMessage `json:"message,omitempty"`
 	Timestamp int64         `json:"timestamp"`

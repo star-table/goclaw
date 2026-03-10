@@ -216,6 +216,150 @@ func (p *OpenAIProvider) ChatWithTools(ctx context.Context, messages []Message, 
 	return p.Chat(ctx, messages, tools, options...)
 }
 
+// ChatStream 流式聊天 - 使用 langchaingo 原生流式支持
+func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []Message, tools []ToolDefinition, callback StreamCallback, options ...ChatOption) error {
+	opts := &ChatOptions{
+		Model:       p.model,
+		Temperature: 0.7,
+		MaxTokens:   p.maxTokens,
+		Stream:      true,
+	}
+
+	for _, opt := range options {
+		opt(opts)
+	}
+
+	// 转换消息格式
+	langchainMessages := make([]llms.MessageContent, len(messages))
+	for i, msg := range messages {
+		var role llms.ChatMessageType
+		switch msg.Role {
+		case "user":
+			role = llms.ChatMessageTypeHuman
+		case "assistant":
+			role = llms.ChatMessageTypeAI
+		case "system":
+			role = llms.ChatMessageTypeSystem
+		case "tool":
+			role = llms.ChatMessageTypeTool
+		default:
+			role = llms.ChatMessageTypeHuman
+		}
+
+		if msg.Role == "tool" {
+			langchainMessages[i] = llms.MessageContent{
+				Role: role,
+				Parts: []llms.ContentPart{
+					llms.ToolCallResponse{
+						ToolCallID: msg.ToolCallID,
+						Name:       msg.ToolName,
+						Content:    msg.Content,
+					},
+				},
+			}
+		} else if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			parts := []llms.ContentPart{
+				llms.TextPart(msg.Content),
+			}
+			for _, tc := range msg.ToolCalls {
+				args, _ := json.Marshal(tc.Params)
+				parts = append(parts, llms.ToolCall{
+					ID:   tc.ID,
+					Type: "function",
+					FunctionCall: &llms.FunctionCall{
+						Name:      tc.Name,
+						Arguments: string(args),
+					},
+				})
+			}
+			langchainMessages[i] = llms.MessageContent{
+				Role:  role,
+				Parts: parts,
+			}
+		} else {
+			langchainMessages[i] = llms.TextParts(role, msg.Content)
+		}
+	}
+
+	// 调用 LLM 选项
+	var llmOpts []llms.CallOption
+	if opts.Temperature > 0 {
+		llmOpts = append(llmOpts, llms.WithTemperature(float64(opts.Temperature)))
+	}
+	if opts.MaxTokens > 0 {
+		llmOpts = append(llmOpts, llms.WithMaxTokens(int(opts.MaxTokens)))
+	}
+
+	// 如果有工具，添加工具选项
+	if len(tools) > 0 {
+		langchainTools := make([]llms.Tool, len(tools))
+		for i, tool := range tools {
+			langchainTools[i] = llms.Tool{
+				Type: "function",
+				Function: &llms.FunctionDefinition{
+					Name:        tool.Name,
+					Description: tool.Description,
+					Parameters:  tool.Parameters,
+				},
+			}
+		}
+		llmOpts = append(llmOpts, llms.WithTools(langchainTools))
+	}
+
+	// 添加流式回调 - 这是关键！
+	llmOpts = append(llmOpts, llms.WithStreamingFunc(func(ctx context.Context, chunk []byte) error {
+		if len(chunk) > 0 {
+			callback(StreamChunk{
+				Content: string(chunk),
+				Done:    false,
+			})
+		}
+		return nil
+	}))
+
+	// 调用 LLM
+	completion, err := p.llm.GenerateContent(ctx, langchainMessages, llmOpts...)
+	if err != nil {
+		callback(StreamChunk{
+			Error: err,
+			Done:  true,
+		})
+		return fmt.Errorf("failed to generate content: %w", err)
+	}
+
+	// 解析工具调用
+	if len(completion.Choices) > 0 && len(completion.Choices[0].ToolCalls) > 0 {
+		for _, tc := range completion.Choices[0].ToolCalls {
+			var params map[string]interface{}
+			if err := json.Unmarshal([]byte(tc.FunctionCall.Arguments), &params); err != nil {
+				logger.Error("Failed to unmarshal tool arguments",
+					zap.String("tool", tc.FunctionCall.Name),
+					zap.String("id", tc.ID),
+					zap.Error(err))
+				params = map[string]interface{}{
+					"__error__":         fmt.Sprintf("Failed to parse arguments: %v", err),
+					"__raw_arguments__": tc.FunctionCall.Arguments,
+				}
+			}
+			callback(StreamChunk{
+				ToolCall: &ToolCall{
+					ID:     tc.ID,
+					Name:   tc.FunctionCall.Name,
+					Params: params,
+				},
+				Done: false,
+			})
+		}
+	}
+
+	// 发送完成信号
+	callback(StreamChunk{
+		Done: true,
+	})
+
+	return nil
+}
+
 // Close 关闭连接
 func (p *OpenAIProvider) Close() error {
 	return nil
