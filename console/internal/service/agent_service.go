@@ -1088,45 +1088,12 @@ func (s *AgentService) convertEventWithContext(event *agent.Event, streamCtx *st
 		}
 
 	case agent.EventToolExecutionStart:
-		seqNum := streamCtx.sequenceNum
-		streamCtx.sequenceNum++
-		return &model.AgentEvent{
-			Object:         "message",
-			ID:             event.ToolID,
-			Role:           "assistant",
-			Type:           "function_call",
-			Status:         "in_progress",
-			SequenceNumber: seqNum,
-			CreatedAt:      streamCtx.startTime,
-			SessionID:      streamCtx.sessionID,
-			Timestamp:      event.Timestamp,
-			Content: []model.ContentPart{
-				{
-					Object: "content",
-					Type:   "data",
-					Data: map[string]interface{}{
-						"call_id":   event.ToolID,
-						"name":      event.ToolName,
-						"arguments": event.ToolArgs,
-					},
-				},
-			},
-		}
+		// Skip tool execution start events - these are internal LLM data not meant for frontend
+		return nil
 
 	case agent.EventToolExecutionEnd:
-		seqNum := streamCtx.sequenceNum
-		streamCtx.sequenceNum++
-		return &model.AgentEvent{
-			Object:         "message",
-			ID:             event.ToolID,
-			Role:           "assistant",
-			Type:           "function_call_output",
-			Status:         "completed",
-			SequenceNumber: seqNum,
-			CreatedAt:      streamCtx.startTime,
-			SessionID:      streamCtx.sessionID,
-			Timestamp:      event.Timestamp,
-		}
+		// Skip tool execution end events - these are internal LLM data not meant for frontend
+		return nil
 
 	case agent.EventTurnStart, agent.EventTurnEnd:
 		seqNum := streamCtx.sequenceNum
