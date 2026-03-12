@@ -492,11 +492,9 @@ func (s *AgentService) ProcessMessageStream(ctx context.Context, req *model.Agen
 		return event
 	}
 
-	// Send initial response created event
-	eventChan <- nextEvent("response", "created")
-
-	// Send response in_progress event
-	eventChan <- nextEvent("response", "in_progress")
+	// Note: response events (created/in_progress/completed) are now handled
+	// by convertEventWithContext through EventAgentStart/EventAgentEnd events
+	// No need to send manual response events here
 
 	// Start processing in goroutine
 	go func() {
@@ -943,10 +941,10 @@ func (s *AgentService) convertContentBlocks(blocks []agent.ContentBlock) []model
 
 // convertEventWithContext converts an agent event to an API event with stream context
 func (s *AgentService) convertEventWithContext(event *agent.Event, streamCtx *streamContext) *model.AgentEvent {
+	streamCtx.sequenceNum++
 	switch event.Type {
 	case agent.EventAgentStart:
 		seqNum := streamCtx.sequenceNum
-		streamCtx.sequenceNum++
 		return &model.AgentEvent{
 			Object:         "response",
 			ID:             streamCtx.responseID,
@@ -959,7 +957,6 @@ func (s *AgentService) convertEventWithContext(event *agent.Event, streamCtx *st
 
 	case agent.EventAgentEnd:
 		seqNum := streamCtx.sequenceNum
-		streamCtx.sequenceNum++
 		return &model.AgentEvent{
 			Object:         "response",
 			ID:             streamCtx.responseID,
@@ -973,7 +970,6 @@ func (s *AgentService) convertEventWithContext(event *agent.Event, streamCtx *st
 
 	case agent.EventMessageStart:
 		seqNum := streamCtx.sequenceNum
-		streamCtx.sequenceNum++
 		msgID := "msg_" + uuid.New().String()
 		streamCtx.currentMsgID = msgID
 		return &model.AgentEvent{
@@ -990,7 +986,6 @@ func (s *AgentService) convertEventWithContext(event *agent.Event, streamCtx *st
 
 	case agent.EventStreamContent:
 		seqNum := streamCtx.sequenceNum
-		streamCtx.sequenceNum++
 		msgID := streamCtx.currentMsgID
 		if msgID == "" {
 			msgID = "msg_" + uuid.New().String()
@@ -1012,7 +1007,6 @@ func (s *AgentService) convertEventWithContext(event *agent.Event, streamCtx *st
 
 	case agent.EventStreamThinking:
 		seqNum := streamCtx.sequenceNum
-		streamCtx.sequenceNum++
 		msgID := streamCtx.currentMsgID
 		if msgID == "" {
 			msgID = "msg_" + uuid.New().String()
@@ -1034,7 +1028,6 @@ func (s *AgentService) convertEventWithContext(event *agent.Event, streamCtx *st
 
 	case agent.EventStreamFinal:
 		seqNum := streamCtx.sequenceNum
-		streamCtx.sequenceNum++
 		msgID := streamCtx.currentMsgID
 		if msgID == "" {
 			msgID = "msg_" + uuid.New().String()
@@ -1056,7 +1049,6 @@ func (s *AgentService) convertEventWithContext(event *agent.Event, streamCtx *st
 
 	case agent.EventStreamDone:
 		seqNum := streamCtx.sequenceNum
-		streamCtx.sequenceNum++
 		return &model.AgentEvent{
 			Object:         "content",
 			ID:             uuid.New().String(),
@@ -1070,7 +1062,6 @@ func (s *AgentService) convertEventWithContext(event *agent.Event, streamCtx *st
 
 	case agent.EventMessageEnd:
 		seqNum := streamCtx.sequenceNum
-		streamCtx.sequenceNum++
 		msgID := streamCtx.currentMsgID
 		if msgID == "" {
 			msgID = "msg_" + uuid.New().String()
@@ -1097,7 +1088,6 @@ func (s *AgentService) convertEventWithContext(event *agent.Event, streamCtx *st
 
 	case agent.EventTurnStart, agent.EventTurnEnd:
 		seqNum := streamCtx.sequenceNum
-		streamCtx.sequenceNum++
 		return &model.AgentEvent{
 			Object:         "response",
 			ID:             streamCtx.responseID,
