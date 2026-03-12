@@ -148,6 +148,7 @@ func main() {
 
 	// Initialize agent service (requires valid provider configuration)
 	agentSvc := service.NewAgentService(cfg, sessionMgr, messageBus, skillsLoader)
+	agentSvc.SetChatService(chatSvc) // Set the chat service for auto-creating chats
 	if err := agentSvc.Initialize(context.Background()); err != nil {
 		logger.Warn("Failed to initialize agent service, running in degraded mode", zap.Error(err))
 	}
